@@ -86,6 +86,7 @@ typedef struct thpool_ {
 	pthread_mutex_t thcount_lock; /* used for thread count etc */
 	pthread_cond_t threads_all_idle; /* signal to thpool_wait     */
 	jobqueue jobqueue; /* job queue                 */
+	char name[64]; /* threadpool name */
 } thpool_;
 
 /* ========================== PROTOTYPES ============================ */
@@ -110,7 +111,7 @@ static void bsem_wait(struct bsem *bsem_p);
 /* ========================== THREADPOOL ============================ */
 
 /* Initialise thread pool */
-struct thpool_ *thpool_init(int num_threads)
+struct thpool_ *thpool_init(int num_threads, const char *name)
 {
 	threads_on_hold = 0;
 	threads_keepalive = 1;
@@ -118,6 +119,10 @@ struct thpool_ *thpool_init(int num_threads)
 	if (num_threads < 0) {
 		num_threads = 0;
 	}
+
+	if (num_threads == 0)
+		printf("(Warn) No thread created because num_threads of threadpool(%s) is 0.\n",
+		       name);
 
 	/* Make new thread pool */
 	thpool_ *thpool_p;
@@ -128,6 +133,10 @@ struct thpool_ *thpool_init(int num_threads)
 	}
 	thpool_p->num_threads_alive = 0;
 	thpool_p->num_threads_working = 0;
+	if (name)
+		sprintf(thpool_p->name, "_%s", name);
+	else
+		sprintf(thpool_p->name, "thpool");
 
 	/* Initialise the job queue */
 	if (jobqueue_init(&thpool_p->jobqueue) == -1) {
@@ -308,8 +317,9 @@ static void thread_hold(int sig_id)
 static void *thread_do(struct thread *thread_p)
 {
 	/* Set thread name for profiling and debugging */
-	char thread_name[16] = { 0 };
+	char thread_name[128] = { 0 };
 	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
+	sprintf(thread_name, "%s_%d", thread_p->thpool_p->name, thread_p->id);
 
 #if defined(__linux__)
 	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */
@@ -322,7 +332,7 @@ static void *thread_do(struct thread *thread_p)
 
 	/* Set tid of this thread in thpool. */
 	tls_tid = thread_p->id;
-	printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
+	// printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
 
 	/* Assure all threads have been created before starting serving */
 	thpool_ *thpool_p = thread_p->thpool_p;
