@@ -44,7 +44,7 @@
 static volatile int threads_keepalive;
 static volatile int threads_on_hold;
 
-// __thread int tls_tid;
+__thread int tls_tid;
 
 /* ========================== STRUCTURES ============================ */
 
@@ -331,8 +331,8 @@ static void *thread_do(struct thread *thread_p)
 #endif
 
 	/* Set tid of this thread in thpool. */
-	// tls_tid = thread_p->id;
-	// printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
+	tls_tid = thread_p->id;
+	printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
 
 	/* Assure all threads have been created before starting serving */
 	thpool_ *thpool_p = thread_p->thpool_p;
