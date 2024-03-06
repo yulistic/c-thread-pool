@@ -8,6 +8,9 @@
 /** @file thpool.h */ /*
  *
  ********************************/
+#include <stdint.h> /* still wondering why include order makes error... */
+#define __USE_GNU
+#include <sched.h>
 
 #if defined(__APPLE__)
 #include <AvailabilityMacros.h>
@@ -109,6 +112,17 @@ static void bsem_post_all(struct bsem *bsem_p);
 static void bsem_wait(struct bsem *bsem_p);
 
 /* ========================== THREADPOOL ============================ */
+
+static void pinning_cpu(int id)
+{
+	pthread_t thr = pthread_self();
+	cpu_set_t set;
+
+	CPU_ZERO(&set);
+
+	CPU_SET(id, &set);
+	pthread_setaffinity_np(thr, CPU_SETSIZE, &set);
+}
 
 /* Initialise thread pool */
 struct thpool_ *thpool_init(int num_threads, const char *name)
@@ -316,6 +330,9 @@ static void thread_hold(int sig_id)
 */
 static void *thread_do(struct thread *thread_p)
 {
+	/* for SPDK */
+	pinning_cpu(thread_p->id);
+
 	/* Set thread name for profiling and debugging */
 	char thread_name[128] = { 0 };
 	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
