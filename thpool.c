@@ -265,7 +265,7 @@ void thpool_pause(thpool_ *thpool_p)
 {
 	int n;
 	for (n = 0; n < thpool_p->num_threads_alive; n++) {
-		pthread_kill(thpool_p->threads[n]->pthread, SIGUSR1);
+		pthread_kill(thpool_p->threads[n]->pthread, SIGUSR2);
 	}
 }
 
@@ -349,7 +349,7 @@ static void *thread_do(struct thread *thread_p)
 
 	/* Set tid of this thread in thpool. */
 	tls_tid = thread_p->id;
-	printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
+	// printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
 
 	/* Assure all threads have been created before starting serving */
 	thpool_ *thpool_p = thread_p->thpool_p;
@@ -359,8 +359,8 @@ static void *thread_do(struct thread *thread_p)
 	sigemptyset(&act.sa_mask);
 	act.sa_flags = 0;
 	act.sa_handler = thread_hold;
-	if (sigaction(SIGUSR1, &act, NULL) == -1) {
-		err("thread_do(): cannot handle SIGUSR1");
+	if (sigaction(SIGUSR2, &act, NULL) == -1) {
+		err("thread_do(): cannot handle SIGUSR2");
 	}
 
 	/* Mark thread as alive (initialized) */
