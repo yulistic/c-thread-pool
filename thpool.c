@@ -99,6 +99,10 @@ static void *thread_do(struct thread *thread_p);
 static void thread_hold(int sig_id);
 static void thread_destroy(struct thread *thread_p);
 
+// SPDK setting
+static int spdk_thread_init(thpool_ *, struct thread **, int);
+static void *spdk_thread_do(struct thread *);
+
 static int jobqueue_init(jobqueue *jobqueue_p);
 static void jobqueue_clear(jobqueue *jobqueue_p);
 static void jobqueue_push(jobqueue *jobqueue_p, struct job *newjob_p);
@@ -176,6 +180,69 @@ struct thpool_ *thpool_init(int num_threads, const char *name)
 	int n;
 	for (n = 0; n < num_threads; n++) {
 		thread_init(thpool_p, &thpool_p->threads[n], n);
+#if THPOOL_DEBUG
+		printf("THPOOL_DEBUG: Created thread %d in pool \n", n);
+#endif
+	}
+
+	/* Wait for threads to initialize */
+	while (thpool_p->num_threads_alive != num_threads) {
+	}
+
+	return thpool_p;
+}
+
+struct thpool_ *spdk_thpool_init(int num_threads, const char *name)
+{
+	threads_on_hold = 0;
+	threads_keepalive = 1;
+
+	if (num_threads < 0) {
+		num_threads = 0;
+	}
+
+	if (num_threads == 0)
+		printf("(Warn) No thread created because num_threads of threadpool(%s) is 0.\n",
+		       name);
+
+	/* Make new thread pool */
+	thpool_ *thpool_p;
+	thpool_p = (struct thpool_ *)malloc(sizeof(struct thpool_));
+	if (thpool_p == NULL) {
+		err("thpool_init(): Could not allocate memory for thread pool\n");
+		return NULL;
+	}
+	thpool_p->num_threads_alive = 0;
+	thpool_p->num_threads_working = 0;
+	if (name)
+		sprintf(thpool_p->name, "_%s", name);
+	else
+		sprintf(thpool_p->name, "thpool");
+
+	/* Initialise the job queue */
+	if (jobqueue_init(&thpool_p->jobqueue) == -1) {
+		err("thpool_init(): Could not allocate memory for job queue\n");
+		free(thpool_p);
+		return NULL;
+	}
+
+	/* Make threads in pool */
+	thpool_p->threads =
+		(struct thread **)malloc(num_threads * sizeof(struct thread *));
+	if (thpool_p->threads == NULL) {
+		err("thpool_init(): Could not allocate memory for threads\n");
+		jobqueue_destroy(&thpool_p->jobqueue);
+		free(thpool_p);
+		return NULL;
+	}
+
+	pthread_mutex_init(&(thpool_p->thcount_lock), NULL);
+	pthread_cond_init(&thpool_p->threads_all_idle, NULL);
+
+	/* Thread init */
+	int n;
+	for (n = 0; n < num_threads; n++) {
+		spdk_thread_init(thpool_p, &thpool_p->threads[n], n);
 #if THPOOL_DEBUG
 		printf("THPOOL_DEBUG: Created thread %d in pool \n", n);
 #endif
@@ -334,6 +401,103 @@ static void thread_hold(int sig_id)
 * @return nothing
 */
 static void *thread_do(struct thread *thread_p)
+{
+	/* Set thread name for profiling and debugging */
+	char thread_name[128] = { 0 };
+	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
+	sprintf(thread_name, "%s_%d", thread_p->thpool_p->name, thread_p->id);
+
+#if defined(__linux__)
+	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */
+	prctl(PR_SET_NAME, thread_name);
+#elif defined(__APPLE__) && defined(__MACH__)
+	pthread_setname_np(thread_name);
+#else
+	err("thread_do(): pthread_setname_np is not supported on this system");
+#endif
+
+	/* Set tid of this thread in thpool. */
+	tls_tid = thread_p->id;
+	// printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
+
+	/* Assure all threads have been created before starting serving */
+	thpool_ *thpool_p = thread_p->thpool_p;
+
+	/* Register signal handler */
+	struct sigaction act;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = 0;
+	act.sa_handler = thread_hold;
+	if (sigaction(SIGUSR2, &act, NULL) == -1) {
+		err("thread_do(): cannot handle SIGUSR2");
+	}
+
+	/* Mark thread as alive (initialized) */
+	pthread_mutex_lock(&thpool_p->thcount_lock);
+	thpool_p->num_threads_alive += 1;
+	pthread_mutex_unlock(&thpool_p->thcount_lock);
+
+	while (threads_keepalive) {
+		bsem_wait(thpool_p->jobqueue.has_jobs);
+
+		if (threads_keepalive) {
+			pthread_mutex_lock(&thpool_p->thcount_lock);
+			thpool_p->num_threads_working++;
+			pthread_mutex_unlock(&thpool_p->thcount_lock);
+
+			/* Read job from queue and execute it */
+			void (*func_buff)(void *);
+			void *arg_buff;
+			job *job_p = jobqueue_pull(&thpool_p->jobqueue);
+			if (job_p) {
+				func_buff = job_p->function;
+				arg_buff = job_p->arg;
+				func_buff(arg_buff);
+				free(job_p);
+			}
+
+			pthread_mutex_lock(&thpool_p->thcount_lock);
+			thpool_p->num_threads_working--;
+			if (!thpool_p->num_threads_working) {
+				pthread_cond_signal(
+					&thpool_p->threads_all_idle);
+			}
+			pthread_mutex_unlock(&thpool_p->thcount_lock);
+		}
+	}
+	pthread_mutex_lock(&thpool_p->thcount_lock);
+	thpool_p->num_threads_alive--;
+	pthread_mutex_unlock(&thpool_p->thcount_lock);
+
+	return NULL;
+}
+
+static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
+{
+	*thread_p = (struct thread *)malloc(sizeof(struct thread));
+	if (*thread_p == NULL) {
+		err("thread_init(): Could not allocate memory for thread\n");
+		return -1;
+	}
+
+	(*thread_p)->thpool_p = thpool_p;
+	(*thread_p)->id = id;
+
+	pthread_create(&(*thread_p)->pthread, NULL,
+		       (void *(*)(void *))spdk_thread_do, (*thread_p));
+	pthread_detach((*thread_p)->pthread);
+	return 0;
+}
+
+/* What each thread is doing
+*
+* In principle this is an endless loop. The only time this loop gets interuppted is once
+* thpool_destroy() is invoked or the program exits.
+*
+* @param  thread        thread that will run this function
+* @return nothing
+*/
+static void *spdk_thread_do(struct thread *thread_p)
 {
 	/* for SPDK */
 	pinning_cpu(thread_p->id);

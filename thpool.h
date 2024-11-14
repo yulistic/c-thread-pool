@@ -37,6 +37,9 @@ extern __thread int tls_tid;
  */
 threadpool thpool_init(int num_threads, const char *name);
 
+/* For SPDK I/O polling thread */
+threadpool spdk_thpool_init(int num_threads, const char *name);
+
 /**
  * @brief Add work to the job queue
  *
