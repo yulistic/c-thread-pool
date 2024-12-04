@@ -48,6 +48,7 @@ static volatile int threads_keepalive;
 static volatile int threads_on_hold;
 
 __thread int tls_tid;
+__thread int tls_ioworker;
 
 /* ========================== STRUCTURES ============================ */
 
@@ -518,6 +519,7 @@ static void *spdk_thread_do(struct thread *thread_p)
 
 	/* Set tid of this thread in thpool. */
 	tls_tid = thread_p->id;
+	tls_ioworker = 1;
 	// printf("thread_name=%s tls_tid=%d\n", thread_name, tls_tid);
 
 	/* Assure all threads have been created before starting serving */

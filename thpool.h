@@ -16,6 +16,7 @@ extern "C" {
 typedef struct thpool_ *threadpool;
 
 extern __thread int tls_tid;
+extern __thread int tls_ioworker;
 
 /**
  * @brief  Initialize threadpool
