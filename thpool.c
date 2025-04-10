@@ -490,6 +490,8 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 	return 0;
 }
 
+#define NUMA0 0
+#define NUMA1 16
 /* What each thread is doing
 *
 * In principle this is an endless loop. The only time this loop gets interuppted is once
@@ -501,7 +503,7 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 static void *spdk_thread_do(struct thread *thread_p)
 {
 	/* for SPDK */
-	pinning_cpu(thread_p->id);
+	pinning_cpu(thread_p->id + NUMA1);
 
 	/* Set thread name for profiling and debugging */
 	char thread_name[128] = { 0 };
