@@ -504,11 +504,15 @@ static void *spdk_thread_do(struct thread *thread_p)
 {
 	/* for SPDK */
 	pinning_cpu(thread_p->id + NUMA1);
+	// pinning_cpu(thread_p->id);
 
 	/* Set thread name for profiling and debugging */
 	char thread_name[128] = { 0 };
 	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
 	sprintf(thread_name, "%s_%d", thread_p->thpool_p->name, thread_p->id);
+
+	printf("thread_name=%s pinned to cpu %d\n", thread_name, thread_p->id + NUMA1);
+	// printf("thread_name=%s pinned to cpu %d\n", thread_name, thread_p->id);
 
 #if defined(__linux__)
 	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */
