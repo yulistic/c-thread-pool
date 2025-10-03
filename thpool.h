@@ -180,6 +180,10 @@ int thpool_num_threads_working(threadpool);
 
 int thpool_num_threads_alive(threadpool);
 
+#ifdef THPOOL_PROFILE
+void thpool_profile_print_summary(threadpool);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

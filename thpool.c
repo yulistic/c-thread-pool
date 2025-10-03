@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
@@ -43,6 +44,28 @@
 #else
 #define err(str)
 #endif
+
+/* ====================== PROFILING (optional) ====================== */
+/* Enable profiling and histogram. Comment out to disable. You can enable them
+ * with -DTHPOOL_PROFILE and -DTHPOOL_PROFILE_HIST when compiling.
+ */
+// #define THPOOL_PROFILE
+// #define THPOOL_PROFILE_HIST
+
+#ifdef THPOOL_PROFILE
+static inline uint64_t thpool_now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+#ifdef THPOOL_PROFILE_HIST
+/* Histogram configuration: first bin [0,1us), then [1,2), [2,4), ... */
+#define THPOOL_HIST_START_NS 1000ULL /* lower bound for second bin */
+#define THPOOL_HIST_NUM_BINS 22 /* include [0,1us) bin plus overflow */
+#endif /* THPOOL_PROFILE_HIST */
+#endif /* THPOOL_PROFILE */
 
 static volatile int threads_keepalive;
 static volatile int threads_on_hold;
@@ -64,6 +87,9 @@ typedef struct job {
 	struct job *prev; /* pointer to previous job   */
 	void (*function)(void *arg); /* function pointer          */
 	void *arg; /* function's argument       */
+#ifdef THPOOL_PROFILE
+	uint64_t enq_ns; /* enqueue timestamp (ns)    */
+#endif
 } job;
 
 /* Job queue */
@@ -91,6 +117,16 @@ typedef struct thpool_ {
 	pthread_cond_t threads_all_idle; /* signal to thpool_wait     */
 	jobqueue jobqueue; /* job queue                 */
 	char name[64]; /* threadpool name */
+#ifdef THPOOL_PROFILE
+	pthread_mutex_t qdelay_lock; /* protects profiling fields */
+	unsigned long long qdelay_count;
+	unsigned long long qdelay_sum_ns;
+	unsigned long long qdelay_max_ns;
+	unsigned long long qdelay_min_ns;
+#ifdef THPOOL_PROFILE_HIST
+	unsigned long long qdelay_hist[THPOOL_HIST_NUM_BINS];
+#endif
+#endif
 } thpool_;
 
 /* ========================== PROTOTYPES ============================ */
@@ -115,6 +151,89 @@ static void bsem_reset(struct bsem *bsem_p);
 static void bsem_post(struct bsem *bsem_p);
 static void bsem_post_all(struct bsem *bsem_p);
 static void bsem_wait(struct bsem *bsem_p);
+
+#ifdef THPOOL_PROFILE
+static void thpool_profile_record(struct thpool_ *pool, uint64_t delay_ns);
+#endif
+
+#ifdef THPOOL_PROFILE
+static void thpool_profile_record(struct thpool_ *pool, uint64_t delay_ns)
+{
+	pthread_mutex_lock(&pool->qdelay_lock);
+	pool->qdelay_count++;
+	pool->qdelay_sum_ns += delay_ns;
+	if (delay_ns > pool->qdelay_max_ns)
+		pool->qdelay_max_ns = delay_ns;
+	if (delay_ns < pool->qdelay_min_ns)
+		pool->qdelay_min_ns = delay_ns;
+	/* histogram binning */
+#ifdef THPOOL_PROFILE_HIST
+	unsigned int bin = 0;
+	uint64_t threshold = THPOOL_HIST_START_NS;
+	while (bin + 1 < THPOOL_HIST_NUM_BINS && delay_ns >= threshold) {
+		threshold <<= 1; /* double */
+		bin++;
+	}
+	pool->qdelay_hist[bin]++;
+#endif
+	pthread_mutex_unlock(&pool->qdelay_lock);
+}
+
+void thpool_profile_print_summary(struct thpool_ *pool)
+{
+	pthread_mutex_lock(&pool->qdelay_lock);
+	if (pool->qdelay_count) {
+		unsigned long long avg_ns = pool->qdelay_sum_ns / pool->qdelay_count;
+		double avg_us = (double)avg_ns / 1000.0;
+		double min_us = (double)pool->qdelay_min_ns / 1000.0;
+		double max_us = (double)pool->qdelay_max_ns / 1000.0;
+		fprintf(stderr, "[Thpool_Queue_Delay(us)] %s:\n", pool->name);
+		fprintf(stderr, "count,avg,min,max\n");
+		fprintf(stderr, "%llu,%.2f,%.2f,%.2f\n", pool->qdelay_count,
+			avg_us, min_us, max_us);
+
+#ifdef THPOOL_PROFILE_HIST
+		/* ASCII histogram */
+		unsigned long long max_bin = 0;
+		for (unsigned int i = 0; i < THPOOL_HIST_NUM_BINS; ++i) {
+			if (pool->qdelay_hist[i] > max_bin) max_bin = pool->qdelay_hist[i];
+		}
+		if (max_bin == 0) max_bin = 1;
+		fprintf(stderr, "[Thpool_Histogram(us)] %s:\n", pool->name);
+		for (unsigned int i = 0; i < THPOOL_HIST_NUM_BINS; ++i) {
+			unsigned long long low_us;
+			unsigned long long high_us;
+			if (i == 0) {
+				low_us = 0ULL;
+				high_us = 1ULL;
+			} else if (i + 1 < THPOOL_HIST_NUM_BINS) {
+				low_us = 1ULL << (i - 1);
+				high_us = 1ULL << i;
+			} else {
+				low_us = 1ULL << (THPOOL_HIST_NUM_BINS - 2);
+				high_us = 0ULL; /* +inf */
+			}
+			/* scale to 50 chars */
+			unsigned int bar = (unsigned int)(50ULL * pool->qdelay_hist[i] / max_bin);
+			if (i + 1 < THPOOL_HIST_NUM_BINS) {
+				fprintf(stderr, "  [%10llu,%10llu) %10llu | ",
+					low_us,
+					high_us,
+					(unsigned long long)pool->qdelay_hist[i]);
+			} else {
+				fprintf(stderr, "  [%10llu,%10s) %10llu | ",
+					low_us,
+					"+inf",
+					(unsigned long long)pool->qdelay_hist[i]);
+			}
+			for (unsigned int j = 0; j < bar; ++j) fputc('#', stderr);
+			fputc('\n', stderr);
+		}
+#endif
+	}
+	pthread_mutex_unlock(&pool->qdelay_lock);
+}
+#endif
 
 /* ========================== THREADPOOL ============================ */
 
@@ -176,6 +295,18 @@ struct thpool_ *thpool_init(int num_threads, const char *name)
 
 	pthread_mutex_init(&(thpool_p->thcount_lock), NULL);
 	pthread_cond_init(&thpool_p->threads_all_idle, NULL);
+#ifdef THPOOL_PROFILE
+	printf("((WARN)) THPOOL_PROFILE is enabled in thpool.c. Turn it off for better performance.\n");
+
+	pthread_mutex_init(&(thpool_p->qdelay_lock), NULL);
+	thpool_p->qdelay_count = 0;
+	thpool_p->qdelay_sum_ns = 0;
+	thpool_p->qdelay_max_ns = 0;
+	thpool_p->qdelay_min_ns = ~0ULL;
+#ifdef THPOOL_PROFILE_HIST
+	for (unsigned int __i = 0; __i < THPOOL_HIST_NUM_BINS; ++__i) thpool_p->qdelay_hist[__i] = 0ULL;
+#endif
+#endif
 
 	/* Thread init */
 	int n;
@@ -239,6 +370,16 @@ struct thpool_ *spdk_thpool_init(int num_threads, const char *name)
 
 	pthread_mutex_init(&(thpool_p->thcount_lock), NULL);
 	pthread_cond_init(&thpool_p->threads_all_idle, NULL);
+#ifdef THPOOL_PROFILE
+	pthread_mutex_init(&(thpool_p->qdelay_lock), NULL);
+	thpool_p->qdelay_count = 0;
+	thpool_p->qdelay_sum_ns = 0;
+	thpool_p->qdelay_max_ns = 0;
+	thpool_p->qdelay_min_ns = ~0ULL;
+#ifdef THPOOL_PROFILE_HIST
+	for (unsigned int __i = 0; __i < THPOOL_HIST_NUM_BINS; ++__i) thpool_p->qdelay_hist[__i] = 0ULL;
+#endif
+#endif
 
 	/* Thread init */
 	int n;
@@ -270,6 +411,9 @@ int thpool_add_work(thpool_ *thpool_p, void (*function_p)(void *), void *arg_p)
 	/* add function and argument */
 	newjob->function = function_p;
 	newjob->arg = arg_p;
+#ifdef THPOOL_PROFILE
+	newjob->enq_ns = thpool_now_ns();
+#endif
 
 	/* add job to queue */
 	jobqueue_push(&thpool_p->jobqueue, newjob);
@@ -319,6 +463,10 @@ void thpool_destroy(thpool_ *thpool_p)
 
 	/* Job queue cleanup */
 	jobqueue_destroy(&thpool_p->jobqueue);
+#ifdef THPOOL_PROFILE
+	/* Print profiling summary */
+	thpool_profile_print_summary(thpool_p);
+#endif
 	/* Deallocs */
 	int n;
 	for (n = 0; n < threads_total; n++) {
@@ -395,7 +543,7 @@ static void thread_hold(int sig_id)
 
 /* What each thread is doing
 *
-* In principle this is an endless loop. The only time this loop gets interuppted is once
+* In principle this is an endless loop. The only time this loop gets interrupted is once
 * thpool_destroy() is invoked or the program exits.
 *
 * @param  thread        thread that will run this function
@@ -453,6 +601,10 @@ static void *thread_do(struct thread *thread_p)
 			if (job_p) {
 				func_buff = job_p->function;
 				arg_buff = job_p->arg;
+#ifdef THPOOL_PROFILE
+				uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
+				thpool_profile_record(thpool_p, __delay_ns);
+#endif
 				func_buff(arg_buff);
 				free(job_p);
 			}
@@ -490,11 +642,12 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 	return 0;
 }
 
+// HARDCODED
 #define NUMA0 0
 #define NUMA1 16
 /* What each thread is doing
 *
-* In principle this is an endless loop. The only time this loop gets interuppted is once
+* In principle this is an endless loop. The only time this loop gets interrupted is once
 * thpool_destroy() is invoked or the program exits.
 *
 * @param  thread        thread that will run this function
@@ -560,6 +713,10 @@ static void *spdk_thread_do(struct thread *thread_p)
 			if (job_p) {
 				func_buff = job_p->function;
 				arg_buff = job_p->arg;
+#ifdef THPOOL_PROFILE
+				uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
+				thpool_profile_record(thpool_p, __delay_ns);
+#endif
 				func_buff(arg_buff);
 				free(job_p);
 			}
