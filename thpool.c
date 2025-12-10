@@ -24,7 +24,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <errno.h>
 #include <time.h>
 #include <limits.h>
 #if defined(__linux__)
@@ -92,12 +91,15 @@ typedef struct job {
 #endif
 } job;
 
+static pthread_mutex_t job_mem_mutex = PTHREAD_MUTEX_INITIALIZER;
+static job *job_mem_freelist = NULL;
+
 /* Job queue */
 typedef struct jobqueue {
 	pthread_mutex_t rwmutex; /* used for queue r/w access */
+	pthread_cond_t has_jobs; /* signal when jobs are available */
 	job *front; /* pointer to front of queue */
 	job *rear; /* pointer to rear  of queue */
-	bsem *has_jobs; /* flag as binary semaphore  */
 	int len; /* number of jobs in queue   */
 } jobqueue;
 
@@ -131,6 +133,9 @@ typedef struct thpool_ {
 
 /* ========================== PROTOTYPES ============================ */
 
+static job *job_get(void);
+static void job_put(struct job *job_p);
+
 static int thread_init(thpool_ *thpool_p, struct thread **thread_p, int id);
 static void *thread_do(struct thread *thread_p);
 static void thread_hold(int sig_id);
@@ -145,12 +150,6 @@ static void jobqueue_clear(jobqueue *jobqueue_p);
 static void jobqueue_push(jobqueue *jobqueue_p, struct job *newjob_p);
 static struct job *jobqueue_pull(jobqueue *jobqueue_p);
 static void jobqueue_destroy(jobqueue *jobqueue_p);
-
-static void bsem_init(struct bsem *bsem_p, int value);
-static void bsem_reset(struct bsem *bsem_p);
-static void bsem_post(struct bsem *bsem_p);
-static void bsem_post_all(struct bsem *bsem_p);
-static void bsem_wait(struct bsem *bsem_p);
 
 #ifdef THPOOL_PROFILE
 static void thpool_profile_record(struct thpool_ *pool, uint64_t delay_ns);
@@ -402,7 +401,7 @@ int thpool_add_work(thpool_ *thpool_p, void (*function_p)(void *), void *arg_p)
 {
 	job *newjob;
 
-	newjob = (struct job *)malloc(sizeof(struct job));
+	newjob = job_get();
 	if (newjob == NULL) {
 		err("thpool_add_work(): Could not allocate memory for new job\n");
 		return -1;
@@ -450,14 +449,18 @@ void thpool_destroy(thpool_ *thpool_p)
 	double tpassed = 0.0;
 	time(&start);
 	while (tpassed < TIMEOUT && thpool_p->num_threads_alive) {
-		bsem_post_all(thpool_p->jobqueue.has_jobs);
+		pthread_mutex_lock(&thpool_p->jobqueue.rwmutex);
+		pthread_cond_broadcast(&thpool_p->jobqueue.has_jobs);
+		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
 		time(&end);
 		tpassed = difftime(end, start);
 	}
 
 	/* Poll remaining threads */
 	while (thpool_p->num_threads_alive) {
-		bsem_post_all(thpool_p->jobqueue.has_jobs);
+		pthread_mutex_lock(&thpool_p->jobqueue.rwmutex);
+		pthread_cond_broadcast(&thpool_p->jobqueue.has_jobs);
+		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
 		sleep(1);
 	}
 
@@ -587,27 +590,35 @@ static void *thread_do(struct thread *thread_p)
 	pthread_mutex_unlock(&thpool_p->thcount_lock);
 
 	while (threads_keepalive) {
-		bsem_wait(thpool_p->jobqueue.has_jobs);
+		pthread_mutex_lock(&thpool_p->jobqueue.rwmutex);
+		while (thpool_p->jobqueue.len == 0 && threads_keepalive) {
+			pthread_cond_wait(&thpool_p->jobqueue.has_jobs,
+					  &thpool_p->jobqueue.rwmutex);
+		}
+		if (!threads_keepalive) {
+			pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
+			break;
+		}
 
-		if (threads_keepalive) {
+		/* Read job from queue and execute it */
+		void (*func_buff)(void *);
+		void *arg_buff;
+		job *job_p = jobqueue_pull(&thpool_p->jobqueue);
+		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
+
+		if (job_p) {
 			pthread_mutex_lock(&thpool_p->thcount_lock);
 			thpool_p->num_threads_working++;
 			pthread_mutex_unlock(&thpool_p->thcount_lock);
 
-			/* Read job from queue and execute it */
-			void (*func_buff)(void *);
-			void *arg_buff;
-			job *job_p = jobqueue_pull(&thpool_p->jobqueue);
-			if (job_p) {
-				func_buff = job_p->function;
-				arg_buff = job_p->arg;
+			func_buff = job_p->function;
+			arg_buff = job_p->arg;
 #ifdef THPOOL_PROFILE
-				uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
-				thpool_profile_record(thpool_p, __delay_ns);
+			uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
+			thpool_profile_record(thpool_p, __delay_ns);
 #endif
-				func_buff(arg_buff);
-				free(job_p);
-			}
+			func_buff(arg_buff);
+			job_put(job_p);
 
 			pthread_mutex_lock(&thpool_p->thcount_lock);
 			thpool_p->num_threads_working--;
@@ -699,27 +710,35 @@ static void *spdk_thread_do(struct thread *thread_p)
 	pthread_mutex_unlock(&thpool_p->thcount_lock);
 
 	while (threads_keepalive) {
-		bsem_wait(thpool_p->jobqueue.has_jobs);
+		pthread_mutex_lock(&thpool_p->jobqueue.rwmutex);
+		while (thpool_p->jobqueue.len == 0 && threads_keepalive) {
+			pthread_cond_wait(&thpool_p->jobqueue.has_jobs,
+					  &thpool_p->jobqueue.rwmutex);
+		}
+		if (!threads_keepalive) {
+			pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
+			break;
+		}
 
-		if (threads_keepalive) {
+		/* Read job from queue and execute it */
+		void (*func_buff)(void *);
+		void *arg_buff;
+		job *job_p = jobqueue_pull(&thpool_p->jobqueue);
+		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
+
+		if (job_p) {
 			pthread_mutex_lock(&thpool_p->thcount_lock);
 			thpool_p->num_threads_working++;
 			pthread_mutex_unlock(&thpool_p->thcount_lock);
 
-			/* Read job from queue and execute it */
-			void (*func_buff)(void *);
-			void *arg_buff;
-			job *job_p = jobqueue_pull(&thpool_p->jobqueue);
-			if (job_p) {
-				func_buff = job_p->function;
-				arg_buff = job_p->arg;
+			func_buff = job_p->function;
+			arg_buff = job_p->arg;
 #ifdef THPOOL_PROFILE
-				uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
-				thpool_profile_record(thpool_p, __delay_ns);
+			uint64_t __delay_ns = thpool_now_ns() - job_p->enq_ns;
+			thpool_profile_record(thpool_p, __delay_ns);
 #endif
-				func_buff(arg_buff);
-				free(job_p);
-			}
+			func_buff(arg_buff);
+			job_put(job_p);
 
 			pthread_mutex_lock(&thpool_p->thcount_lock);
 			thpool_p->num_threads_working--;
@@ -745,20 +764,47 @@ static void thread_destroy(thread *thread_p)
 
 /* ============================ JOB QUEUE =========================== */
 
+static job *job_get(void)
+{
+	job *job_p;
+
+	pthread_mutex_lock(&job_mem_mutex);
+	job_p = job_mem_freelist;
+	if (job_p) {
+		job_mem_freelist = job_p->prev;
+	}
+	pthread_mutex_unlock(&job_mem_mutex);
+
+	if (job_p == NULL) {
+		job_p = (job *)malloc(sizeof(job));
+		if (job_p == NULL) {
+			err("job_get(): Could not allocate memory for new job\n");
+		}
+	}
+
+	return job_p;
+}
+
+static void job_put(job *job_p)
+{
+	if (job_p == NULL) {
+		return;
+	}
+
+	pthread_mutex_lock(&job_mem_mutex);
+	job_p->prev = job_mem_freelist;
+	job_mem_freelist = job_p;
+	pthread_mutex_unlock(&job_mem_mutex);
+}
+
 /* Initialize queue */
 static int jobqueue_init(jobqueue *jobqueue_p)
 {
 	jobqueue_p->len = 0;
 	jobqueue_p->front = NULL;
 	jobqueue_p->rear = NULL;
-
-	jobqueue_p->has_jobs = (struct bsem *)malloc(sizeof(struct bsem));
-	if (jobqueue_p->has_jobs == NULL) {
-		return -1;
-	}
-
 	pthread_mutex_init(&(jobqueue_p->rwmutex), NULL);
-	bsem_init(jobqueue_p->has_jobs, 0);
+	pthread_cond_init(&(jobqueue_p->has_jobs), NULL);
 
 	return 0;
 }
@@ -766,14 +812,32 @@ static int jobqueue_init(jobqueue *jobqueue_p)
 /* Clear the queue */
 static void jobqueue_clear(jobqueue *jobqueue_p)
 {
+	pthread_mutex_lock(&jobqueue_p->rwmutex);
 	while (jobqueue_p->len) {
-		free(jobqueue_pull(jobqueue_p));
-	}
+		job *job_p = jobqueue_p->front;
 
+		switch (jobqueue_p->len) {
+		case 0:
+			break;
+		case 1:
+			jobqueue_p->front = NULL;
+			jobqueue_p->rear = NULL;
+			jobqueue_p->len = 0;
+			break;
+		default:
+			jobqueue_p->front = job_p->prev;
+			jobqueue_p->len--;
+			break;
+		}
+
+		pthread_mutex_unlock(&jobqueue_p->rwmutex);
+		job_put(job_p);
+		pthread_mutex_lock(&jobqueue_p->rwmutex);
+	}
 	jobqueue_p->front = NULL;
 	jobqueue_p->rear = NULL;
-	bsem_reset(jobqueue_p->has_jobs);
 	jobqueue_p->len = 0;
+	pthread_mutex_unlock(&jobqueue_p->rwmutex);
 }
 
 /* Add (allocated) job to queue
@@ -794,17 +858,14 @@ static void jobqueue_push(jobqueue *jobqueue_p, struct job *newjob)
 		jobqueue_p->rear = newjob;
 	}
 	jobqueue_p->len++;
-
-	bsem_post(jobqueue_p->has_jobs);
+	pthread_cond_signal(&jobqueue_p->has_jobs);
 	pthread_mutex_unlock(&jobqueue_p->rwmutex);
 }
 
 /* Get first job from queue(removes it from queue)
- * Notice: Caller MUST hold a mutex
  */
 static struct job *jobqueue_pull(jobqueue *jobqueue_p)
 {
-	pthread_mutex_lock(&jobqueue_p->rwmutex);
 	job *job_p = jobqueue_p->front;
 
 	switch (jobqueue_p->len) {
@@ -820,11 +881,7 @@ static struct job *jobqueue_pull(jobqueue *jobqueue_p)
 	default: /* if >1 jobs in queue */
 		jobqueue_p->front = job_p->prev;
 		jobqueue_p->len--;
-		/* more than one job in queue -> post it */
-		bsem_post(jobqueue_p->has_jobs);
 	}
-
-	pthread_mutex_unlock(&jobqueue_p->rwmutex);
 	return job_p;
 }
 
@@ -832,54 +889,6 @@ static struct job *jobqueue_pull(jobqueue *jobqueue_p)
 static void jobqueue_destroy(jobqueue *jobqueue_p)
 {
 	jobqueue_clear(jobqueue_p);
-	free(jobqueue_p->has_jobs);
-}
-
-/* ======================== SYNCHRONISATION ========================= */
-
-/* Init semaphore to 1 or 0 */
-static void bsem_init(bsem *bsem_p, int value)
-{
-	if (value < 0 || value > 1) {
-		err("bsem_init(): Binary semaphore can take only values 1 or 0");
-		exit(1);
-	}
-	pthread_mutex_init(&(bsem_p->mutex), NULL);
-	pthread_cond_init(&(bsem_p->cond), NULL);
-	bsem_p->v = value;
-}
-
-/* Reset semaphore to 0 */
-static void bsem_reset(bsem *bsem_p)
-{
-	bsem_init(bsem_p, 0);
-}
-
-/* Post to at least one thread */
-static void bsem_post(bsem *bsem_p)
-{
-	pthread_mutex_lock(&bsem_p->mutex);
-	bsem_p->v = 1;
-	pthread_cond_signal(&bsem_p->cond);
-	pthread_mutex_unlock(&bsem_p->mutex);
-}
-
-/* Post to all threads */
-static void bsem_post_all(bsem *bsem_p)
-{
-	pthread_mutex_lock(&bsem_p->mutex);
-	bsem_p->v = 1;
-	pthread_cond_broadcast(&bsem_p->cond);
-	pthread_mutex_unlock(&bsem_p->mutex);
-}
-
-/* Wait on semaphore until semaphore has value 0 */
-static void bsem_wait(bsem *bsem_p)
-{
-	pthread_mutex_lock(&bsem_p->mutex);
-	while (bsem_p->v != 1) {
-		pthread_cond_wait(&bsem_p->cond, &bsem_p->mutex);
-	}
-	bsem_p->v = 0;
-	pthread_mutex_unlock(&bsem_p->mutex);
+	pthread_mutex_destroy(&jobqueue_p->rwmutex);
+	pthread_cond_destroy(&jobqueue_p->has_jobs);
 }
