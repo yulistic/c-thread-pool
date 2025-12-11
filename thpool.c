@@ -600,6 +600,10 @@ static void *thread_do(struct thread *thread_p)
 			break;
 		}
 
+		pthread_mutex_lock(&thpool_p->thcount_lock);
+		thpool_p->num_threads_working++;
+		pthread_mutex_unlock(&thpool_p->thcount_lock);
+
 		/* Read job from queue and execute it */
 		void (*func_buff)(void *);
 		void *arg_buff;
@@ -607,10 +611,6 @@ static void *thread_do(struct thread *thread_p)
 		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
 
 		if (job_p) {
-			pthread_mutex_lock(&thpool_p->thcount_lock);
-			thpool_p->num_threads_working++;
-			pthread_mutex_unlock(&thpool_p->thcount_lock);
-
 			func_buff = job_p->function;
 			arg_buff = job_p->arg;
 #ifdef THPOOL_PROFILE
@@ -619,15 +619,14 @@ static void *thread_do(struct thread *thread_p)
 #endif
 			func_buff(arg_buff);
 			job_put(job_p);
-
-			pthread_mutex_lock(&thpool_p->thcount_lock);
-			thpool_p->num_threads_working--;
-			if (!thpool_p->num_threads_working) {
-				pthread_cond_signal(
-					&thpool_p->threads_all_idle);
-			}
-			pthread_mutex_unlock(&thpool_p->thcount_lock);
 		}
+
+		pthread_mutex_lock(&thpool_p->thcount_lock);
+		thpool_p->num_threads_working--;
+		if (!thpool_p->num_threads_working) {
+			pthread_cond_signal(&thpool_p->threads_all_idle);
+		}
+		pthread_mutex_unlock(&thpool_p->thcount_lock);
 	}
 	pthread_mutex_lock(&thpool_p->thcount_lock);
 	thpool_p->num_threads_alive--;
@@ -720,6 +719,10 @@ static void *spdk_thread_do(struct thread *thread_p)
 			break;
 		}
 
+		pthread_mutex_lock(&thpool_p->thcount_lock);
+		thpool_p->num_threads_working++;
+		pthread_mutex_unlock(&thpool_p->thcount_lock);
+
 		/* Read job from queue and execute it */
 		void (*func_buff)(void *);
 		void *arg_buff;
@@ -727,10 +730,6 @@ static void *spdk_thread_do(struct thread *thread_p)
 		pthread_mutex_unlock(&thpool_p->jobqueue.rwmutex);
 
 		if (job_p) {
-			pthread_mutex_lock(&thpool_p->thcount_lock);
-			thpool_p->num_threads_working++;
-			pthread_mutex_unlock(&thpool_p->thcount_lock);
-
 			func_buff = job_p->function;
 			arg_buff = job_p->arg;
 #ifdef THPOOL_PROFILE
@@ -739,15 +738,14 @@ static void *spdk_thread_do(struct thread *thread_p)
 #endif
 			func_buff(arg_buff);
 			job_put(job_p);
-
-			pthread_mutex_lock(&thpool_p->thcount_lock);
-			thpool_p->num_threads_working--;
-			if (!thpool_p->num_threads_working) {
-				pthread_cond_signal(
-					&thpool_p->threads_all_idle);
-			}
-			pthread_mutex_unlock(&thpool_p->thcount_lock);
 		}
+
+		pthread_mutex_lock(&thpool_p->thcount_lock);
+		thpool_p->num_threads_working--;
+		if (!thpool_p->num_threads_working) {
+			pthread_cond_signal(&thpool_p->threads_all_idle);
+		}
+		pthread_mutex_unlock(&thpool_p->thcount_lock);
 	}
 	pthread_mutex_lock(&thpool_p->thcount_lock);
 	thpool_p->num_threads_alive--;
