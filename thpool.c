@@ -31,6 +31,7 @@
 #endif
 
 #include "thpool.h"
+#include "cpu_pinning.h"
 
 #ifdef THPOOL_DEBUG
 #define THPOOL_DEBUG 1
@@ -113,6 +114,7 @@ typedef struct thread {
 /* Threadpool */
 typedef struct thpool_ {
 	thread **threads; /* pointer to threads        */
+	int num_threads; /* total threads created (set at init) */
 	volatile int num_threads_alive; /* threads currently alive   */
 	volatile int num_threads_working; /* threads currently working */
 	pthread_mutex_t thcount_lock; /* used for thread count etc */
@@ -268,6 +270,7 @@ struct thpool_ *thpool_init(int num_threads, const char *name)
 		err("thpool_init(): Could not allocate memory for thread pool\n");
 		return NULL;
 	}
+	thpool_p->num_threads = num_threads;
 	thpool_p->num_threads_alive = 0;
 	thpool_p->num_threads_working = 0;
 	if (name)
@@ -343,6 +346,7 @@ struct thpool_ *spdk_thpool_init(int num_threads, const char *name)
 		err("thpool_init(): Could not allocate memory for thread pool\n");
 		return NULL;
 	}
+	thpool_p->num_threads = num_threads;
 	thpool_p->num_threads_alive = 0;
 	thpool_p->num_threads_working = 0;
 	if (name)
@@ -652,9 +656,10 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 	return 0;
 }
 
-// HARDCODED
-#define NUMA0 0
-#define NUMA1 16
+/* CPU pinning policy lives in include/common/cpu_pinning.h so thpool
+ * and nvme.c share a single source of truth. See oxb_pin_cpu_for_tid().
+ */
+
 /* What each thread is doing
 *
 * In principle this is an endless loop. The only time this loop gets interrupted is once
@@ -666,16 +671,18 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 static void *spdk_thread_do(struct thread *thread_p)
 {
 	/* for SPDK */
-	pinning_cpu(thread_p->id + NUMA1);
-	// pinning_cpu(thread_p->id);
+	int total_threads = thread_p->thpool_p->num_threads;
+	int target_cpu = oxb_pin_cpu_for_tid(thread_p->id, total_threads);
+
+	pinning_cpu(target_cpu);
 
 	/* Set thread name for profiling and debugging */
 	char thread_name[128] = { 0 };
 	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
 	sprintf(thread_name, "%s_%d", thread_p->thpool_p->name, thread_p->id);
 
-	printf("thread_name=%s pinned to cpu %d\n", thread_name, thread_p->id + NUMA1);
-	// printf("thread_name=%s pinned to cpu %d\n", thread_name, thread_p->id);
+	printf("thread_name=%s pinned to cpu %d (total_threads=%d)\n",
+	       thread_name, target_cpu, total_threads);
 
 #if defined(__linux__)
 	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */
