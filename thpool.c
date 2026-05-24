@@ -115,6 +115,7 @@ typedef struct thread {
 typedef struct thpool_ {
 	thread **threads; /* pointer to threads        */
 	int num_threads; /* total threads created (set at init) */
+	enum oxb_pin_domain pin_domain; /* SPDK worker CPU policy */
 	volatile int num_threads_alive; /* threads currently alive   */
 	volatile int num_threads_working; /* threads currently working */
 	pthread_mutex_t thcount_lock; /* used for thread count etc */
@@ -271,6 +272,7 @@ struct thpool_ *thpool_init(int num_threads, const char *name)
 		return NULL;
 	}
 	thpool_p->num_threads = num_threads;
+	thpool_p->pin_domain = OXB_PIN_DOMAIN_SECURE_DAEMON;
 	thpool_p->num_threads_alive = 0;
 	thpool_p->num_threads_working = 0;
 	if (name)
@@ -328,6 +330,13 @@ struct thpool_ *thpool_init(int num_threads, const char *name)
 
 struct thpool_ *spdk_thpool_init(int num_threads, const char *name)
 {
+	return spdk_thpool_init_with_pinning(
+		num_threads, name, OXB_PIN_DOMAIN_SECURE_DAEMON);
+}
+
+struct thpool_ *spdk_thpool_init_with_pinning(int num_threads, const char *name,
+					     enum oxb_pin_domain pin_domain)
+{
 	threads_on_hold = 0;
 	threads_keepalive = 1;
 
@@ -347,6 +356,7 @@ struct thpool_ *spdk_thpool_init(int num_threads, const char *name)
 		return NULL;
 	}
 	thpool_p->num_threads = num_threads;
+	thpool_p->pin_domain = pin_domain;
 	thpool_p->num_threads_alive = 0;
 	thpool_p->num_threads_working = 0;
 	if (name)
@@ -656,8 +666,8 @@ static int spdk_thread_init(thpool_ *thpool_p, struct thread **thread_p, int id)
 	return 0;
 }
 
-/* CPU pinning policy lives in include/common/cpu_pinning.h so thpool
- * and nvme.c share a single source of truth. See oxb_pin_cpu_for_tid().
+/* CPU pinning policy lives in include/common/cpu_pinning.h so each daemon
+ * can keep SPDK worker placement disjoint when they share a host.
  */
 
 /* What each thread is doing
@@ -672,7 +682,9 @@ static void *spdk_thread_do(struct thread *thread_p)
 {
 	/* for SPDK */
 	int total_threads = thread_p->thpool_p->num_threads;
-	int target_cpu = oxb_pin_cpu_for_tid(thread_p->id, total_threads);
+	enum oxb_pin_domain pin_domain = thread_p->thpool_p->pin_domain;
+	int target_cpu = oxb_pin_cpu_for_domain(pin_domain, thread_p->id,
+						total_threads);
 
 	pinning_cpu(target_cpu);
 
@@ -681,8 +693,9 @@ static void *spdk_thread_do(struct thread *thread_p)
 	snprintf(thread_name, 16, "thpool-%d", thread_p->id);
 	sprintf(thread_name, "%s_%d", thread_p->thpool_p->name, thread_p->id);
 
-	printf("thread_name=%s pinned to cpu %d (total_threads=%d)\n",
-	       thread_name, target_cpu, total_threads);
+	printf("thread_name=%s pinned to cpu %d (domain=%s, total_threads=%d)\n",
+	       thread_name, target_cpu, oxb_pin_domain_name(pin_domain),
+	       total_threads);
 
 #if defined(__linux__)
 	/* Use prctl instead to prevent using _GNU_SOURCE flag and implicit declaration */

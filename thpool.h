@@ -7,6 +7,8 @@
 #ifndef _THPOOL_
 #define _THPOOL_
 
+#include "cpu_pinning.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +42,8 @@ threadpool thpool_init(int num_threads, const char *name);
 
 /* For SPDK I/O polling thread */
 threadpool spdk_thpool_init(int num_threads, const char *name);
+threadpool spdk_thpool_init_with_pinning(int num_threads, const char *name,
+					 enum oxb_pin_domain pin_domain);
 
 /**
  * @brief Add work to the job queue
